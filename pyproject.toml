@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "aircraft-identification"
+version = "0.1.0"
+description = "Aircraft model identification using Kalman Filter"
+authors = ["Your Name <your.email@example.com>"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "3.12.10"
+numpy = "^1.26.0"
+matplotlib = "^3.8.0"
+scipy = "^1.13.0"
+filterpy = "^1.4.5"
+pandas = "^2.2.0"
+scikit-learn = "^1.4.0"
+control = "^0.10.2"
+
+[tool.poetry.group.dev.dependencies]
+jupyter = "^1.0.0"
+ipykernel = "^6.29.0"
+black = "^24.0.0"
+flake8 = "^7.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
