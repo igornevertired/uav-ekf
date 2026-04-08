@@ -1,7 +1,7 @@
 [tool.poetry]
-name = "aircraft-identification"
+name = "navigation-models"
 version = "0.1.0"
-description = "Aircraft model identification using Kalman Filter"
+description = "Strapdown INS and GNSS receiver toy models"
 authors = ["Your Name <your.email@example.com>"]
 package-mode = false
 
@@ -9,17 +9,13 @@ package-mode = false
 python = "3.12.10"
 numpy = "^1.26.0"
 matplotlib = "^3.8.0"
-scipy = "^1.13.0"
-filterpy = "^1.4.5"
-pandas = "^2.2.0"
-scikit-learn = "^1.4.0"
-control = "^0.10.2"
 
 [tool.poetry.group.dev.dependencies]
-jupyter = "^1.0.0"
-ipykernel = "^6.29.0"
-black = "^24.0.0"
-flake8 = "^7.0.0"
+pytest = "^8.0.0"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["poetry-core"]

@@ -2,5 +2,6 @@
 /.vscode
 /.env
 /.pytest_cache
-/.pytest_cache
 /.idea
+/output
+./__pycache__
