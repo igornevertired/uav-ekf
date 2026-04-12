@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .bins import Bins2Params
+from .noise import imu_reference_sigmas
 
 
 def initial_attitude_nue(theta: float) -> tuple[np.ndarray, np.ndarray]:
@@ -50,9 +51,10 @@ def zala421_default_config() -> Zala421Config:
     a_true_body = np.array([0.0, 0.0, 0.0], dtype=float)
     w_true_body = np.array([0.0, 0.0, 0.0], dtype=float)
 
+    imu_sig = imu_reference_sigmas()
     bins_params = Bins2Params(
-        dw=np.array([1e-5, 1e-5, 1e-5], dtype=float),
-        da=np.array([1e-4, 1e-4, 1e-4], dtype=float),
+        dw=imu_sig["gyro_bias"].copy(),
+        da=imu_sig["accel_bias"].copy(),
         kmw=np.zeros((3, 3), dtype=float),
         kma=np.zeros((3, 3), dtype=float),
         fiw=np.eye(3, dtype=float),

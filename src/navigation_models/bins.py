@@ -28,17 +28,23 @@ def _dlu(a_true: np.ndarray, params: Bins2Params, noise: ImuNoise) -> np.ndarray
     return (np.eye(3) + params.kma) @ a_p + params.da + noise.wn_a
 
 
+def gyro_measurement(w_true: np.ndarray, params: Bins2Params, noise: ImuNoise) -> np.ndarray:
+    return _dus(w_true=w_true, params=params, noise=noise)
+
+
+def accel_measurement(a_true: np.ndarray, params: Bins2Params, noise: ImuNoise) -> np.ndarray:
+    return _dlu(a_true=a_true, params=params, noise=noise)
+
+
 def _navigation(
     a_dlu: np.ndarray,
     c_bn: np.ndarray,
     np_state: np.ndarray,
     dt: float,
-    h_et: float,
-    dh_et: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     ue = 7292115.0e-11
     vbe_n = np_state[:3].copy()
-    h = h_et
+    h = np_state[3]
     fi = np_state[4]
     lamd = np_state[5]
 
@@ -72,8 +78,6 @@ def _navigation(
     dnp = np.array([dvbe_n[0], dvbe_n[1], dvbe_n[2], dh, dfi, dlamd], dtype=float)
 
     np_new = np_state + dnp * dt
-    np_new[3] = h_et
-    np_new[1] = dh_et
     return np_new, dvbe_n
 
 
@@ -83,12 +87,10 @@ def _orientation(
     c_bn_prev: np.ndarray,
     np_state: np.ndarray,
     dt: float,
-    h_et: float,
-    dh_et: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     ue = 7292115.0e-11
-    vbe_n = np.array([np_state[0], dh_et, np_state[2]], dtype=float)
-    h = h_et
+    vbe_n = np_state[:3].copy()
+    h = np_state[3]
     fi = np_state[4]
     lamd = np_state[5]
 
@@ -132,20 +134,16 @@ def bins2_step(
     c_bn: np.ndarray,
     q: np.ndarray,
     dt: float,
-    h_et: float,
-    dh_et: float,
     params: Bins2Params,
     noise: ImuNoise,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    w_dus = _dus(w_true=w_true, params=params, noise=noise)
-    a_dlu = _dlu(a_true=a_true, params=params, noise=noise)
+    w_dus = gyro_measurement(w_true=w_true, params=params, noise=noise)
+    a_dlu = accel_measurement(a_true=a_true, params=params, noise=noise)
     np_new, _ = _navigation(
         a_dlu=a_dlu,
         c_bn=c_bn,
         np_state=np_state,
         dt=dt,
-        h_et=h_et,
-        dh_et=dh_et,
     )
     c_bn_new, q_new = _orientation(
         w_dus=w_dus,
@@ -153,7 +151,5 @@ def bins2_step(
         c_bn_prev=c_bn,
         np_state=np_state,
         dt=dt,
-        h_et=h_et,
-        dh_et=dh_et,
     )
     return q_new, c_bn_new, np_new, a_dlu

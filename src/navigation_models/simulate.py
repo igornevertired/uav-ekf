@@ -17,10 +17,12 @@ from models.aircraft_dynamics import (
     load_factor_nz,
 )
 from src.filters.parameter_ekf import ParameterEkfConfig, parameter_ekf_step
-from src.navigation_models.bins import bins2_step
+from src.navigation_models.altimeter import altimeter_measurement, altimeter_reference_sigma
+from src.navigation_models.bins import bins2_step, gyro_measurement
 from src.navigation_models.earth import earth_model
-from src.navigation_models.gnss import GnssNoise, gnss_measurement
+from src.navigation_models.gnss import GnssNoise, gnss_measurement, gnss_reference_sigmas
 from src.navigation_models.noise import NoiseStreams
+from src.navigation_models.noise import q_gyro_measurement_sigma, theta_ins_measurement_sigma
 from src.navigation_models.zala421_16e5 import Zala421Config, zala421_default_config
 
 
@@ -34,84 +36,213 @@ def _delta_angle(a0: float, a1: float) -> float:
     return float((d + np.pi) % (2.0 * np.pi) - np.pi)
 
 
+def elevator_step_command_deg(t: float, t_model: float) -> float:
+    schedule = [
+        (0.0, 5.0, 0.0),
+        (5.0, 8.0, -1.0),
+        (8.0, 11.0, 1.0),
+        (11.0, 13.0, 0.0),
+        (13.0, 15.0, -1.0),
+        (15.0, 17.0, 1.0),
+        (17.0, 18.0, 0.0),
+        (18.0, 19.0, -1.0),
+        (19.0, 20.0, 1.0),
+    ]
+    for t0, t1, level in schedule:
+        if t0 <= t < t1:
+            return float(level)
+    return 0.0
+
+
+def q_excitation_command_deg(t: float) -> float:
+    """Дополнительный короткий doublet для возбуждения канала q."""
+    schedule = [
+        (5.0, 6.2, -2.5),
+        (6.2, 7.4, 2.5),
+        (13.0, 14.2, -2.5),
+        (14.2, 15.4, 2.5),
+        (18.0, 18.8, -2.0),
+        (18.8, 19.6, 2.0),
+    ]
+    for t0, t1, level in schedule:
+        if t0 <= t < t1:
+            return float(level)
+    return 0.0
+
+
+def nav_ekf_initial_sigmas() -> dict[str, float]:
+    """Начальные 1σ ошибки из таблицы на скриншоте, в проекции на наш nav-state."""
+    return {
+        "phi": 1.57e-7,
+        "lambda": 1.57e-7,
+        "vn": 0.02,
+        "ve": 0.02,
+        "vh": 0.02,
+        "h": 1.0,
+        # В 6D модели оставлен только тангаж; берём малую стартовую ошибку БИНС по pitch.
+        "theta": 1.0e-4,
+    }
+
+
+def longitudinal_measurement_from_nav_state(x_nav: np.ndarray) -> np.ndarray:
+    vn = float(x_nav[2])
+    ve = float(x_nav[3])
+    vh = float(x_nav[4])
+    theta = float(x_nav[6])
+    q = float(x_nav[7])
+    r_h = float(np.sqrt(max(vn * vn + ve * ve, 1e-12)))
+    v_mag = float(np.sqrt(max(vn * vn + ve * ve + vh * vh, 1e-12)))
+    gamma = float(np.arctan2(vh, r_h))
+    alpha = float(theta - gamma)
+    return np.array([v_mag, alpha, q, theta], dtype=float)
+
+
+def longitudinal_measurement_jacobian_from_nav(x_nav: np.ndarray) -> np.ndarray:
+    vn = float(x_nav[2])
+    ve = float(x_nav[3])
+    vh = float(x_nav[4])
+    v_mag = float(np.sqrt(max(vn * vn + ve * ve + vh * vh, 1e-12)))
+    r_h = float(np.sqrt(max(vn * vn + ve * ve, 1e-12)))
+    den = float(max(vh * vh + r_h * r_h, 1e-12))
+
+    jac = np.zeros((4, 8), dtype=float)
+    jac[0, 2] = vn / v_mag
+    jac[0, 3] = ve / v_mag
+    jac[0, 4] = vh / v_mag
+
+    dgamma_dvn = -vh * vn / (r_h * den)
+    dgamma_dve = -vh * ve / (r_h * den)
+    dgamma_dvh = r_h / den
+    jac[1, 2] = -dgamma_dvn
+    jac[1, 3] = -dgamma_dve
+    jac[1, 4] = -dgamma_dvh
+    jac[1, 6] = 1.0
+
+    jac[2, 7] = 1.0
+    jac[3, 6] = 1.0
+    return jac
+
+
+def longitudinal_measurement_covariance_from_nav(x_nav: np.ndarray, p_nav: np.ndarray) -> np.ndarray:
+    jac = longitudinal_measurement_jacobian_from_nav(np.asarray(x_nav, dtype=float))
+    p = np.asarray(p_nav, dtype=float)
+    r = jac @ p @ jac.T
+    r = 0.5 * (r + r.T)
+    diag = np.maximum(np.diag(r), 1e-20)
+    r[np.diag_indices_from(r)] = diag
+    return r
+
+
 def ekf_fuse_bins_gnss(
     bins_hist: np.ndarray,
     gnss_hist: np.ndarray,
-    truth_hist: np.ndarray,
+    altimeter_hist: np.ndarray,
+    theta_ins_hist: np.ndarray,
+    q_gyro_hist: np.ndarray,
     c_bn_hist: np.ndarray,
     dt: float,
 ) -> dict[str, np.ndarray]:
     n = bins_hist.shape[0]
-    state_dim = 6
-    meas_dim = 4
+    state_dim = 8
+    meas_dim = 7
     x_hat = np.zeros((n, state_dim), dtype=float)
     p_hist = np.zeros((n, state_dim, state_dim), dtype=float)
-    delta_truth_minus_hat = np.zeros((n, state_dim), dtype=float)
     sig3_hist = np.zeros((n, state_dim), dtype=float)
 
-    gnss_pos_std = (1.0 / 111_000.0) * np.pi / 180.0
-    gnss_vel_std = 1e-2
+    gnss_sig = gnss_reference_sigmas()
+    gnss_pos_std = gnss_sig["phi"]
+    gnss_vel_std = gnss_sig["vn"]
+    alt_std = altimeter_reference_sigma()
+    init_sig = nav_ekf_initial_sigmas()
+    theta_std = theta_ins_measurement_sigma()
+    q_std = q_gyro_measurement_sigma()
 
     bins_nav = np.column_stack(
         [bins_hist[:, 4], bins_hist[:, 5], bins_hist[:, 0], bins_hist[:, 2]]
     )
     vh_bins = bins_hist[:, 1].astype(float)
-    theta_bins = np.array([pitch_from_c_bn(c_bn_hist[k]) for k in range(n)], dtype=float)
+    h_bins = bins_hist[:, 3].astype(float)
 
     H = np.zeros((meas_dim, state_dim), dtype=float)
-    for i in range(meas_dim):
+    for i in range(4):
         H[i, i] = 1.0
+    H[4, 5] = 1.0
+    H[5, 6] = 1.0
+    H[6, 7] = 1.0
 
-    p0_vh = 0.5**2
-    p0_th = (0.05) ** 2
-    x = np.concatenate([gnss_hist[0].copy(), np.array([vh_bins[0], theta_bins[0]], dtype=float)])
+    x = np.concatenate(
+        [
+            gnss_hist[0].copy(),
+            np.array([vh_bins[0], h_bins[0], theta_ins_hist[0], q_gyro_hist[0]], dtype=float),
+        ]
+    )
     p = np.diag(
         [
-            gnss_pos_std**2,
-            gnss_pos_std**2,
-            gnss_vel_std**2,
-            gnss_vel_std**2,
-            p0_vh,
-            p0_th,
+            init_sig["phi"] ** 2,
+            init_sig["lambda"] ** 2,
+            init_sig["vn"] ** 2,
+            init_sig["ve"] ** 2,
+            init_sig["vh"] ** 2,
+            init_sig["h"] ** 2,
+            init_sig["theta"] ** 2,
+            q_std**2,
         ]
     )
 
     q_vel = 1e-5
     q_pos = 1e-14
     q_vh = 2e-6
+    q_h = 1e-3
     q_th = 3e-10
-    q_mat = np.diag([q_pos, q_pos, q_vel, q_vel, q_vh, q_th])
+    q_q = 5e-7
+    q_mat = np.diag([q_pos, q_pos, q_vel, q_vel, q_vh, q_h, q_th, q_q])
 
-    r_mat = np.diag([gnss_pos_std**2, gnss_pos_std**2, gnss_vel_std**2, gnss_vel_std**2])
+    r_mat = np.diag(
+        [gnss_pos_std**2, gnss_pos_std**2, gnss_vel_std**2, gnss_vel_std**2, alt_std**2, theta_std**2, q_std**2]
+    )
 
-    i6 = np.eye(state_dim, dtype=float)
+    i_state = np.eye(state_dim, dtype=float)
 
     for k in range(n):
         if k == 0:
             x_pred = x.copy()
+            f_mat = np.eye(state_dim, dtype=float)
+            f_mat[5, 4] = dt
         else:
             dphi, dlm, dvn, dve = (bins_nav[k] - bins_nav[k - 1]).tolist()
             dvh = float(vh_bins[k] - vh_bins[k - 1])
-            dth = _delta_angle(theta_bins[k - 1], theta_bins[k])
-            x_pred = x + np.array([dphi, dlm, dvn, dve, dvh, dth], dtype=float)
+            dth = _delta_angle(theta_ins_hist[k - 1], theta_ins_hist[k])
+            dq = float(q_gyro_hist[k] - q_gyro_hist[k - 1])
+            x_pred = x.copy()
+            x_pred[:4] = x[:4] + np.array([dphi, dlm, dvn, dve], dtype=float)
+            x_pred[4] = x[4] + dvh
+            x_pred[5] = x[5] + x[4] * dt
+            x_pred[6] = x[6] + dth
+            x_pred[7] = x[7] + dq
+            f_mat = np.eye(state_dim, dtype=float)
+            f_mat[5, 4] = dt
 
-        p_pred = p + q_mat
+        p_pred = f_mat @ p @ f_mat.T + q_mat
 
-        innov = gnss_hist[k] - x_pred[:meas_dim]
+        y = np.concatenate(
+            [
+                gnss_hist[k],
+                np.array([altimeter_hist[k], theta_ins_hist[k], q_gyro_hist[k]], dtype=float),
+            ]
+        )
+        innov = y - H @ x_pred
         s = H @ p_pred @ H.T + r_mat
         k_gain = p_pred @ H.T @ np.linalg.inv(s)
         x = x_pred + k_gain @ innov
-        p = (i6 - k_gain @ H) @ p_pred
+        p = (i_state - k_gain @ H) @ p_pred
 
         x_hat[k] = x
         p_hist[k] = p
-        delta_truth_minus_hat[k] = truth_hist[k] - x
         sig3_hist[k] = 3.0 * np.sqrt(np.maximum(np.diag(p), 0.0))
 
     return {
         "x_hat": x_hat,
         "p": p_hist,
-        "delta_truth_minus_hat": delta_truth_minus_hat,
         "sig3": sig3_hist,
         "nav_state_dim": state_dim,
     }
@@ -145,7 +276,10 @@ def longitudinal_state_from_fusion(
     n = x_hat_nav.shape[0]
     vn = x_hat_nav[:, 2]
     ve = x_hat_nav[:, 3]
-    if x_hat_nav.shape[1] >= 6:
+    if x_hat_nav.shape[1] >= 7:
+        vh = x_hat_nav[:, 4]
+        theta_hat = x_hat_nav[:, 6]
+    elif x_hat_nav.shape[1] >= 6:
         vh = x_hat_nav[:, 4]
         theta_hat = x_hat_nav[:, 5]
     else:
@@ -155,11 +289,136 @@ def longitudinal_state_from_fusion(
     v_mag = np.sqrt(np.maximum(vn**2 + ve**2 + vh**2, 1e-12))
     gamma_hat = np.arctan2(vh, r_h)
     alpha_hat = theta_hat - gamma_hat
-    q_hat = np.gradient(theta_hat, dt)
+    if x_hat_nav.shape[1] >= 8:
+        q_hat = x_hat_nav[:, 7]
+    else:
+        q_hat = np.gradient(theta_hat, dt)
     return np.column_stack([v_mag, alpha_hat, q_hat, theta_hat])
 
 
 upper_stage_kinematics_for_param_ekf = longitudinal_state_from_fusion
+
+
+def aero_param_initial_guess(p_true: np.ndarray) -> np.ndarray:
+    factors = np.array([1.6, 0.4, 1.6, 0.4, 1.6], dtype=float)
+    return np.asarray(p_true, dtype=float) * factors
+
+
+def state5_from_nav_solution(
+    x_hat_nav: np.ndarray,
+    bins_hist: np.ndarray,
+    c_bn_hist: np.ndarray,
+    dt: float,
+) -> np.ndarray:
+    long4 = np.vstack([longitudinal_measurement_from_nav_state(x_hat_nav[k]) for k in range(x_hat_nav.shape[0])])
+    if x_hat_nav.shape[1] >= 8:
+        h_hat = x_hat_nav[:, 5]
+    elif x_hat_nav.shape[1] >= 7:
+        h_hat = x_hat_nav[:, 5]
+    else:
+        h_hat = bins_hist[:, 3]
+    return np.column_stack([long4[:, 0], long4[:, 1], long4[:, 3], long4[:, 2], h_hat])
+
+
+def state5_from_sensor_measurements(
+    gnss_hist: np.ndarray,
+    bins_hist: np.ndarray,
+    theta_ins_hist: np.ndarray,
+    q_gyro_hist: np.ndarray,
+    altimeter_hist: np.ndarray,
+    dt: float,
+) -> np.ndarray:
+    vn = gnss_hist[:, 2]
+    ve = gnss_hist[:, 3]
+    vh = bins_hist[:, 1]
+    r_h = np.sqrt(np.maximum(vn**2 + ve**2, 1e-12))
+    v_mag = np.sqrt(np.maximum(vn**2 + ve**2 + vh**2, 1e-12))
+    gamma = np.arctan2(vh, r_h)
+    alpha = theta_ins_hist - gamma
+    return np.column_stack([v_mag, alpha, theta_ins_hist, q_gyro_hist, altimeter_hist])
+
+
+def sigma3_state5_from_nav_covariance(
+    x_hat_nav: np.ndarray,
+    bins_hist: np.ndarray,
+    p_hist: np.ndarray,
+    dt: float,
+) -> np.ndarray:
+    init_sig = nav_ekf_initial_sigmas()
+    gnss_sig = gnss_reference_sigmas()
+    long_sig3 = sigma3_longitudinal_state(
+        x_hat_nav,
+        bins_hist,
+        p_hist,
+        gnss_vel_std=gnss_sig["vn"],
+        sigma_theta_ins=theta_ins_measurement_sigma(),
+        dt=dt,
+        sigma_vh=init_sig["vh"],
+    )
+    h_sig3 = 3.0 * np.sqrt(np.maximum(p_hist[:, 5, 5], 0.0))
+    th_sig3 = 3.0 * np.sqrt(np.maximum(p_hist[:, 6, 6], 0.0))
+    if p_hist.shape[1] >= 8:
+        q_sig3 = 3.0 * np.sqrt(np.maximum(p_hist[:, 7, 7], 0.0))
+    else:
+        q_sig3 = long_sig3[:, 2]
+    return np.column_stack([long_sig3[:, 0], long_sig3[:, 1], th_sig3, q_sig3, h_sig3])
+
+
+def state_error_series(truth: np.ndarray, estimate: np.ndarray) -> np.ndarray:
+    return np.asarray(estimate, dtype=float) - np.asarray(truth, dtype=float)
+
+
+def q_dot_from_q_series(q_hist: np.ndarray, dt: float) -> np.ndarray:
+    q = np.asarray(q_hist, dtype=float)
+    if q.size == 0:
+        return np.zeros(0, dtype=float)
+    if q.size < 5:
+        return np.gradient(q, max(float(dt), 1e-9))
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=float)
+    kernel /= kernel.sum()
+    q_smooth = np.convolve(q, kernel, mode="same")
+    return np.gradient(q_smooth, max(float(dt), 1e-9))
+
+
+def navigation_outputs_to_parameter_measurements(
+    x_hat_nav: np.ndarray,
+    p_nav_hist: np.ndarray,
+    *,
+    include_nz: bool,
+    include_qdot: bool,
+    delta_e_hist: np.ndarray,
+    plant_params: NonlinearLongitudinalParams,
+    dt: float,
+    nz_var: float = (5e-3) ** 2,
+) -> tuple[np.ndarray, np.ndarray]:
+    n = x_hat_nav.shape[0]
+    meas_dim = 4 + int(include_nz) + int(include_qdot)
+    y_hist = np.zeros((n, meas_dim), dtype=float)
+    r_hist = np.zeros((n, meas_dim, meas_dim), dtype=float)
+    q_dot_hist = q_dot_from_q_series(x_hat_nav[:, 7], dt)
+    q_var = np.maximum(p_nav_hist[:, 7, 7], 1e-20)
+    dt_eff = max(5.0 * float(dt), 1e-9)
+    q_dot_var = np.maximum((2.0 * q_var) / dt_eff**2, 0.12**2)
+    for k in range(n):
+        y_base = longitudinal_measurement_from_nav_state(x_hat_nav[k])
+        r_base = longitudinal_measurement_covariance_from_nav(x_hat_nav[k], p_nav_hist[k])
+        y_parts = [y_base]
+        r_blocks = [r_base]
+        if include_nz:
+            nz_m = load_factor_nz(y_base, float(delta_e_hist[k]), plant_params)
+            y_parts.append(np.array([nz_m], dtype=float))
+            r_blocks.append(np.array([[nz_var]], dtype=float))
+        if include_qdot:
+            y_parts.append(np.array([q_dot_hist[k]], dtype=float))
+            r_blocks.append(np.array([[q_dot_var[k]]], dtype=float))
+        y_hist[k] = np.concatenate(y_parts)
+        r_hist[k] = np.zeros((meas_dim, meas_dim), dtype=float)
+        idx = 0
+        for block in r_blocks:
+            block_dim = block.shape[0]
+            r_hist[k, idx : idx + block_dim, idx : idx + block_dim] = block
+            idx += block_dim
+    return y_hist, r_hist
 
 
 def sigma3_longitudinal_state(
@@ -176,17 +435,21 @@ def sigma3_longitudinal_state(
     n = x_hat_nav.shape[0]
     sig3 = np.zeros((n, 4), dtype=float)
     sig_vh = float(gnss_vel_std if sigma_vh is None else sigma_vh)
-    sigma_q_gyro = 0.02
+    sigma_q_gyro = q_gyro_measurement_sigma()
+    nav7 = x_hat_nav.shape[1] >= 7 and p_hist.shape[1] >= 7
     nav6 = x_hat_nav.shape[1] >= 6 and p_hist.shape[1] >= 6
 
     for k in range(n):
         vn, ve = float(x_hat_nav[k, 2]), float(x_hat_nav[k, 3])
-        vh = float(x_hat_nav[k, 4]) if nav6 else float(bins_hist[k, 1])
+        vh = float(x_hat_nav[k, 4]) if (nav7 or nav6) else float(bins_hist[k, 1])
         p = p_hist[k]
         p22, p33 = float(p[2, 2]), float(p[3, 3])
-        if nav6:
+        if nav7:
+            p44, p66 = float(p[4, 4]), float(p[6, 6])
+            sig_th_k = np.sqrt(max(p66, sigma_theta_ins**2))
+        elif nav6:
             p44, p55 = float(p[4, 4]), float(p[5, 5])
-            sig_th_k = np.sqrt(max(p55, 0.0))
+            sig_th_k = np.sqrt(max(p55, sigma_theta_ins**2))
         else:
             p44, p55 = sig_vh**2, sigma_theta_ins**2
             sig_th_k = sigma_theta_ins
@@ -203,7 +466,12 @@ def sigma3_longitudinal_state(
         dg_dve = -vh * ve / (r_h * den) if den > 0 else 0.0
         dg_dvh = r_h / den if den > 0 else 0.0
         var_gamma = dg_dvn**2 * p22 + dg_dve**2 * p33 + dg_dvh**2 * p44
-        var_alpha = p55 + var_gamma if nav6 else sigma_theta_ins**2 + var_gamma
+        if nav7:
+            var_alpha = sig_th_k**2 + var_gamma
+        elif nav6:
+            var_alpha = sig_th_k**2 + var_gamma
+        else:
+            var_alpha = sigma_theta_ins**2 + var_gamma
         sig3[k, 1] = 3.0 * np.sqrt(max(var_alpha, 0.0))
 
         sig3[k, 3] = 3.0 * sig_th_k
@@ -219,7 +487,7 @@ def run_simulation(
     *,
     auto_trim_thrust: bool = False,
     thrust_newtons: float | None = None,
-    param_ekf_with_nz: bool = False,
+    param_ekf_with_nz: bool = True,
 ) -> dict[str, np.ndarray | dict]:
     cfg = config or zala421_default_config()
     steps = int(t_model / cfg.dt)
@@ -253,32 +521,44 @@ def run_simulation(
     bins_hist = np.zeros((steps, 6), dtype=float)
     c_bn_hist = np.zeros((steps, 3, 3), dtype=float)
     gnss_hist = np.zeros((steps, 4), dtype=float)
+    altimeter_hist = np.zeros(steps, dtype=float)
+    theta_ins_hist = np.zeros(steps, dtype=float)
+    q_gyro_hist = np.zeros(steps, dtype=float)
     t_hist = np.arange(steps, dtype=float) * cfg.dt
     x_true_hist = np.zeros((steps, 4), dtype=float)
+    delta_e_ref_hist = np.zeros(steps, dtype=float)
     delta_e_cmd_hist = np.zeros(steps, dtype=float)
-    truth_nav_hist = np.zeros((steps, 6), dtype=float)
+    truth_nav_hist = np.zeros((steps, 8), dtype=float)
 
     fi_true = float(cfg.np0[4])
     lm_true = float(cfg.np0[5])
     h_true = float(cfg.np0[3])
-
-    n_pulses = 4
-    pulse_width = 3.0
-    pulse_centers = np.linspace(
-        0.5 * pulse_width + 3.0,
-        max(t_model - 0.5 * pulse_width - 3.0, 0.5 * pulse_width + 3.0),
-        n_pulses,
-    )
-    pulse_amp_deg = np.array([-1.25, 1.25, -1.25, 1.25], dtype=float)
+    h_ref = h_true
+    theta_ref = float(x_true[3])
 
     for i in range(steps):
         t = t_hist[i]
-        delta_e_cmd_deg = 0.0
-        for center, amp in zip(pulse_centers, pulse_amp_deg):
-            if abs(t - center) <= pulse_width / 2.0:
-                delta_e_cmd_deg = float(amp)
-                break
-        delta_e = np.deg2rad(delta_e_cmd_deg)
+        delta_e_pulse_deg = elevator_step_command_deg(float(t), float(t_model))
+        delta_e_q_exc_deg = q_excitation_command_deg(float(t))
+        v_ctrl = float(x_true[0])
+        alpha_ctrl = float(x_true[1])
+        q_ctrl = float(x_true[2])
+        theta_ctrl = float(x_true[3])
+        vh_ctrl = v_ctrl * np.sin(theta_ctrl - alpha_ctrl)
+        h_err = h_ref - h_true
+        excitation_active = abs(delta_e_q_exc_deg) > 0.0
+        q_hold_gain = 0.0 if excitation_active else 2.0e-1
+        theta_hold_gain = 2.0e-1 if excitation_active else 8.0e-1
+        delta_e_hold = (
+            1.0e-3 * h_err
+            + 5.0e-2 * vh_ctrl
+            + theta_hold_gain * (theta_ctrl - theta_ref)
+            + q_hold_gain * q_ctrl
+        )
+        delta_e_ref_deg = delta_e_pulse_deg + delta_e_q_exc_deg
+        delta_e = np.deg2rad(delta_e_ref_deg) + delta_e_hold
+        delta_e = float(np.clip(delta_e, np.deg2rad(-8.0), np.deg2rad(8.0)))
+        delta_e_ref_hist[i] = np.deg2rad(delta_e_ref_deg)
         delta_e_cmd_hist[i] = delta_e
 
         a_true_body = compute_specific_force_body(x_true, delta_e, dyn_params)
@@ -301,12 +581,13 @@ def run_simulation(
         h_true += vh_true * cfg.dt
 
         truth_nav_hist[i] = np.array(
-            [fi_true, lm_true, vn_true, ve_true, vh_true, theta_true],
+            [fi_true, lm_true, vn_true, ve_true, vh_true, h_true, theta_true, q_pitch],
             dtype=float,
         )
 
         w_true_body = np.array([0.0, q_pitch, 0.0], dtype=float)
-        imu_noise = noise_streams.sample_imu()
+        imu_noise = noise_streams.sample_imu(cfg.dt)
+        w_gyro = gyro_measurement(w_true=w_true_body, params=cfg.bins_params, noise=imu_noise)
         q, c_bn, np_state, _ = bins2_step(
             a_true=a_true_body,
             w_true=w_true_body,
@@ -314,13 +595,13 @@ def run_simulation(
             c_bn=c_bn,
             q=q,
             dt=cfg.dt,
-            h_et=h_true,
-            dh_et=vh_true,
             params=cfg.bins_params,
             noise=imu_noise,
         )
         bins_hist[i] = np_state
         c_bn_hist[i] = c_bn
+        theta_ins_hist[i] = pitch_from_c_bn(c_bn)
+        q_gyro_hist[i] = float(w_gyro[1] + noise_streams.sample_q_gyro())
 
         wn_fi, wn_lm, wn_vn, wn_ve = noise_streams.sample_gnss()
         z, _ = gnss_measurement(
@@ -332,18 +613,23 @@ def run_simulation(
             scheme=cfg.gnss_scheme,
         )
         gnss_hist[i] = z
+        h_meas, _ = altimeter_measurement(h_true, noise_streams.sample_altimeter())
+        altimeter_hist[i] = h_meas
 
     ekf_out = ekf_fuse_bins_gnss(
         bins_hist=bins_hist,
         gnss_hist=gnss_hist,
-        truth_hist=truth_nav_hist,
+        altimeter_hist=altimeter_hist,
+        theta_ins_hist=theta_ins_hist,
+        q_gyro_hist=q_gyro_hist,
         c_bn_hist=c_bn_hist,
         dt=cfg.dt,
     )
+    ekf_out["delta_truth_minus_hat"] = truth_nav_hist - ekf_out["x_hat"]
 
     pe_hist = np.zeros((steps, 9), dtype=float)
-    meas_dim = 5 if param_ekf_with_nz else 4
-    y_pe_hist = np.zeros((steps, meas_dim), dtype=float)
+    include_qdot = False
+    meas_dim = 4 + int(param_ekf_with_nz) + int(include_qdot)
     p_true = np.array(
         [
             plant_params.cla,
@@ -355,9 +641,9 @@ def run_simulation(
         dtype=float,
     )
     x_pe = np.zeros(9, dtype=float)
-    x_pe[:4] = x_true_hist[0].copy()
-    p_init = p_true * np.array([0.92, 1.08, 0.94, 1.04, 0.96], dtype=float)
+    p_init = aero_param_initial_guess(p_true)
     x_pe[4:9] = p_init.copy()
+    x0_pe = np.concatenate([np.zeros(4, dtype=float), p_init.copy()])
     p_pe = np.diag(
         [
             0.5**2,
@@ -371,32 +657,40 @@ def run_simulation(
             0.15**2,
         ]
     )
-    r_list = [
-        (5e-3) ** 2,
-        (5e-5) ** 2,
-        (5e-4) ** 2,
-        (5e-5) ** 2,
-    ]
-    if param_ekf_with_nz:
-        r_list.append((5e-3) ** 2)
     pe_cfg = ParameterEkfConfig(
         q_diag=np.array(
             [8e-5, 2e-6, 2e-6, 2e-6, 0.0, 0.0, 0.0, 0.0, 0.0],
             dtype=float,
         ),
-        r_diag=np.array(r_list, dtype=float),
+        r_diag=np.zeros(meas_dim, dtype=float),
         include_nz=bool(param_ekf_with_nz),
+        include_qdot=bool(include_qdot),
     )
     x_hat_nav = ekf_out["x_hat"]
-    long_nav = upper_stage_kinematics_for_param_ekf(x_hat_nav, bins_hist, c_bn_hist, cfg.dt)
+    y_pe_hist, r_meas_hist = navigation_outputs_to_parameter_measurements(
+        x_hat_nav,
+        np.asarray(ekf_out["p"], dtype=float),
+        include_nz=bool(param_ekf_with_nz),
+        include_qdot=bool(include_qdot),
+        delta_e_hist=delta_e_cmd_hist,
+        plant_params=plant_params,
+        dt=cfg.dt,
+    )
+    x_pe[:4] = y_pe_hist[0, :4].copy()
+    x0_pe[:4] = x_pe[:4].copy()
     for k in range(steps):
         de = float(delta_e_cmd_hist[k])
-        yk = np.asarray(long_nav[k], dtype=float).copy()
-        if param_ekf_with_nz:
-            nz_m = load_factor_nz(long_nav[k], de, plant_params)
-            yk = np.concatenate([yk, np.array([nz_m], dtype=float)])
-        y_pe_hist[k] = yk
-        x_pe, p_pe = parameter_ekf_step(x_pe, p_pe, yk, de, cfg.dt, plant_params, pe_cfg)
+        yk = y_pe_hist[k].copy()
+        x_pe, p_pe = parameter_ekf_step(
+            x_pe,
+            p_pe,
+            yk,
+            de,
+            cfg.dt,
+            plant_params,
+            pe_cfg,
+            r_override=r_meas_hist[k],
+        )
         pe_hist[k] = x_pe
 
     p_hat_hist = pe_hist[:, 4:9]
@@ -413,15 +707,19 @@ def run_simulation(
     return {
         "time": t_hist,
         "x_true": x_true_hist,
+        "delta_e_ref": delta_e_ref_hist,
         "delta_e_cmd": delta_e_cmd_hist,
         "truth_nav": truth_nav_hist,
         "bins": bins_hist,
         "c_bn": c_bn_hist,
         "gnss": gnss_hist,
+        "altimeter": altimeter_hist,
+        "theta_ins": theta_ins_hist,
+        "q_gyro": q_gyro_hist,
         "ekf": ekf_out,
         "plant_params": plant_params,
         "p_true": p_true,
-        "param_ekf": {"x_hat": pe_hist, "y": y_pe_hist, "p_cov": p_pe},
+        "param_ekf": {"x_hat": pe_hist, "y": y_pe_hist, "p_cov": p_pe, "x0": x0_pe, "r_meas": r_meas_hist},
         "param_error": param_error,
         "param_metrics": {
             "rmse": param_rmse,
@@ -459,183 +757,178 @@ def _fill_sigma_bands_gradient(
         ax.fill_between(t, lo, hi, color=color, alpha=max(a, 0.04), linewidth=0)
 
 
+def state_plot_style(name: str) -> dict[str, float | bool]:
+    highlight = name in {"θ", "q"}
+    return {
+        "model_on_top": highlight,
+        "sigma_on_top": highlight,
+        "sigma_alpha": 0.2 if highlight else 0.12,
+        "error_smoothing_window": 3 if name == "q" else 1,
+    }
+
+
+def smooth_series_for_display(series: np.ndarray, window: int) -> np.ndarray:
+    data = np.asarray(series, dtype=float)
+    win = max(int(window), 1)
+    if win <= 1 or data.size < 3:
+        return data.copy()
+    if win % 2 == 0:
+        win += 1
+    if data.size < win:
+        return data.copy()
+    kernel = np.ones(win, dtype=float) / float(win)
+    pad = win // 2
+    padded = np.pad(data, (pad, pad), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
 def save_simulation_plots(result: dict, out_dir: str | Path) -> list[Path]:
     """Сохраняет набор PNG по результату run_simulation."""
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-    from matplotlib.lines import Line2D
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    for old_png in out.glob("*.png"):
+        old_png.unlink()
     saved: list[Path] = []
 
     t = np.asarray(result["time"], dtype=float)
     x_true = np.asarray(result["x_true"], dtype=float)
+    delta_e_ref = np.asarray(result["delta_e_ref"], dtype=float)
+    delta_e_cmd = np.asarray(result["delta_e_cmd"], dtype=float)
     truth_nav = np.asarray(result["truth_nav"], dtype=float)
     bins_hist = np.asarray(result["bins"], dtype=float)
     gnss_hist = np.asarray(result["gnss"], dtype=float)
+    altimeter_hist = np.asarray(result["altimeter"], dtype=float)
+    theta_ins_hist = np.asarray(result["theta_ins"], dtype=float)
+    q_gyro_hist = np.asarray(result["q_gyro"], dtype=float)
     ekf = result["ekf"]
     x_hat = np.asarray(ekf["x_hat"], dtype=float)
-    delta = np.asarray(ekf["delta_truth_minus_hat"], dtype=float)
-    sig3_nav = np.asarray(ekf["sig3"], dtype=float)
+    p_hist = np.asarray(ekf["p"], dtype=float)
     c_bn_hist = np.asarray(result["c_bn"], dtype=float)
-    cfg_dt = float(t[1] - t[0]) if len(t) > 1 else 0.01
-
-    labels_nav = ["φ", "λ", "Vn", "Ve", "Vh", "θ"]
-    fig, axs = plt.subplots(3, 2, figsize=(11, 8), sharex=True)
-    axs = axs.ravel()
-    for i in range(6):
-        axs[i].plot(t, truth_nav[:, i], "k-", lw=1.0, label="истина")
-        if i < 4:
-            axs[i].plot(t, gnss_hist[:, i], "--", lw=0.8, alpha=0.85, label="GNSS")
-        if i == 0:
-            axs[i].plot(t, bins_hist[:, 4], ":", lw=0.9, alpha=0.9, label="БИНС φ")
-        elif i == 1:
-            axs[i].plot(t, bins_hist[:, 5], ":", lw=0.9, alpha=0.9, label="БИНС λ")
-        elif i == 2:
-            axs[i].plot(t, bins_hist[:, 0], ":", lw=0.9, alpha=0.9, label="БИНС Vn")
-        elif i == 3:
-            axs[i].plot(t, bins_hist[:, 2], ":", lw=0.9, alpha=0.9, label="БИНС Ve")
-        elif i == 4:
-            axs[i].plot(t, bins_hist[:, 1], ":", lw=0.9, alpha=0.9, label="БИНС Vh")
-        elif i == 5:
-            th_bins = np.array([pitch_from_c_bn(c_bn_hist[k]) for k in range(len(t))])
-            axs[i].plot(t, th_bins, ":", lw=0.9, alpha=0.9, label="БИНС θ")
-        axs[i].set_ylabel(labels_nav[i])
-        axs[i].grid(True, alpha=0.3)
-    axs[0].legend(fontsize=7, loc="upper right")
-    axs[-2].set_xlabel("t, с")
-    axs[-1].set_xlabel("t, с")
-    fig.suptitle("Навигация: истина, GNSS, БИНС")
-    fig.tight_layout()
-    p = out / "nav_sensors.png"
-    fig.savefig(p, dpi=140)
-    plt.close(fig)
-    saved.append(p)
-
-    fig, axs = plt.subplots(3, 2, figsize=(11, 8), sharex=True)
-    axs = axs.ravel()
-    for i in range(6):
-        axs[i].plot(t, truth_nav[:, i], "k-", lw=1.0, label="истина")
-        _fill_sigma_bands_gradient(axs[i], t, x_hat[:, i], sig3_nav[:, i], color="C0")
-        axs[i].set_ylabel(labels_nav[i])
-        axs[i].grid(True, alpha=0.3)
-    h = [
-        Line2D([0], [0], color="k", lw=1.0, label="истина"),
-        Line2D([0], [0], color="C0", lw=1.0, label="EKF"),
-        Patch(facecolor="C0", edgecolor="none", alpha=0.15, label="±3σ"),
-    ]
-    axs[0].legend(handles=h, fontsize=8)
-    axs[-2].set_xlabel("t, с")
-    axs[-1].set_xlabel("t, с")
-    fig.suptitle("Навигационный EKF: оценка и ±3σ")
-    fig.tight_layout()
-    p = out / "ekf_nav.png"
-    fig.savefig(p, dpi=140)
-    plt.close(fig)
-    saved.append(p)
-
-    fig, axs = plt.subplots(3, 2, figsize=(11, 8), sharex=True)
-    axs = axs.ravel()
-    for i in range(6):
-        axs[i].plot(t, delta[:, i], color="C3", lw=0.9)
-        axs[i].fill_between(t, -sig3_nav[:, i], sig3_nav[:, i], color="C0", alpha=0.15)
-        axs[i].axhline(0.0, color="k", lw=0.4)
-        axs[i].set_ylabel(f"Δ {labels_nav[i]}")
-        axs[i].grid(True, alpha=0.3)
-    axs[-2].set_xlabel("t, с")
-    axs[-1].set_xlabel("t, с")
-    fig.suptitle("Ошибка навигационного EKF (истина − оценка), полоса ±3σ")
-    fig.tight_layout()
-    p = out / "ekf_nav_error.png"
-    fig.savefig(p, dpi=140)
-    plt.close(fig)
-    saved.append(p)
-
-    fig, axs = plt.subplots(2, 2, figsize=(10, 6), sharex=True)
-    names = ["V", "α", "q", "θ"]
-    for j in range(4):
-        ax = axs.ravel()[j]
-        ax.plot(t, x_true[:, j], "k-", lw=1.0, label="истина")
-        ax.set_ylabel(names[j])
-        ax.grid(True, alpha=0.3)
-    axs[0, 0].legend(fontsize=8)
-    fig.suptitle("Продольное движение (истина)")
-    fig.tight_layout()
-    p = out / "longitudinal_truth.png"
-    fig.savefig(p, dpi=140)
-    plt.close(fig)
-    saved.append(p)
-
-    long_nav = longitudinal_state_from_fusion(x_hat, bins_hist, c_bn_hist, cfg_dt)
-    long_sig3 = sigma3_longitudinal_state(
-        x_hat,
-        bins_hist,
-        ekf["p"],
-        gnss_vel_std=1e-2,
-        sigma_theta_ins=0.05,
-        dt=cfg_dt,
-    )
-    err_long = long_nav - x_true
-    fig, axs = plt.subplots(2, 2, figsize=(10, 6), sharex=True)
-    for j in range(4):
-        ax = axs.ravel()[j]
-        ax.plot(t, long_nav[:, j], color="C0", lw=0.9, label="из нав. EKF")
-        ax.plot(t, x_true[:, j], "k--", lw=0.8, alpha=0.85, label="истина")
-        ax.set_ylabel(names[j])
-        ax.grid(True, alpha=0.3)
-    axs[0, 0].legend(fontsize=7)
-    fig.suptitle("Продольное состояние: кинематика из нав. EKF vs истина")
-    fig.tight_layout()
-    p = out / "longitudinal_nav_vs_truth.png"
-    fig.savefig(p, dpi=140)
-    plt.close(fig)
-    saved.append(p)
-
-    fig, axs = plt.subplots(2, 2, figsize=(10, 6), sharex=True)
-    for j in range(4):
-        ax = axs.ravel()[j]
-        ax.plot(t, err_long[:, j], color="C3", lw=0.8)
-        ax.fill_between(t, -long_sig3[:, j], long_sig3[:, j], color="C0", alpha=0.12)
-        ax.axhline(0.0, color="k", lw=0.4)
-        ax.set_ylabel(f"Δ {names[j]}")
-        ax.grid(True, alpha=0.3)
-    fig.suptitle("Ошибка продольной кинематики ±3σ (аппрокс.)")
-    fig.tight_layout()
-    p = out / "longitudinal_error_sig3.png"
-    fig.savefig(p, dpi=140)
-    plt.close(fig)
-    saved.append(p)
-
-    pe = np.asarray(result["param_ekf"]["x_hat"], dtype=float)
     p_true = np.asarray(result["p_true"], dtype=float)
-    p_names = ["C_Lα", "C_Lδe", "C_mα", "C_mq", "C_mδe"]
-    fig, axs = plt.subplots(5, 1, figsize=(10, 10), sharex=True)
-    for j in range(5):
-        axs[j].plot(t, pe[:, 4 + j], color="C0", lw=0.9, label="оценка")
-        axs[j].axhline(p_true[j], color="k", ls="--", lw=0.9, label="истина")
-        axs[j].set_ylabel(p_names[j])
-        axs[j].grid(True, alpha=0.3)
-    axs[0].legend(fontsize=8)
-    axs[-1].set_xlabel("t, с")
-    fig.suptitle("Parameter EKF: аэродинамические коэффициенты")
+    p_init = np.asarray(result["param_metrics"]["p_initial"], dtype=float)
+    p_final = np.asarray(result["param_metrics"]["p_hat_final"], dtype=float)
+    rel_init = np.asarray(result["param_metrics"]["rel_error_pct_initial"], dtype=float)
+    rel_final = np.asarray(result["param_metrics"]["rel_error_pct_final"], dtype=float)
+    pe = np.asarray(result["param_ekf"]["x_hat"], dtype=float)
+
+    cfg_dt = float(t[1] - t[0]) if len(t) > 1 else 0.01
+    truth_state5 = np.column_stack([x_true[:, 0], x_true[:, 1], x_true[:, 3], x_true[:, 2], truth_nav[:, 5]])
+    sensor_state5 = state5_from_sensor_measurements(
+        gnss_hist, bins_hist, theta_ins_hist, q_gyro_hist, altimeter_hist, cfg_dt
+    )
+    ekf_state5 = state5_from_nav_solution(x_hat, bins_hist, c_bn_hist, cfg_dt)
+    state5_delta = state_error_series(truth_state5, ekf_state5)
+    state5_sig3 = sigma3_state5_from_nav_covariance(x_hat, bins_hist, p_hist, cfg_dt)
+    state_specs = [
+        ("V", "m/s", 1.0, "state_v.png"),
+        ("α", "deg", 180.0 / np.pi, "state_alpha.png"),
+        ("θ", "deg", 180.0 / np.pi, "state_theta.png"),
+        ("q", "deg/s", 180.0 / np.pi, "state_q.png"),
+        ("h", "m", 1.0, "state_h.png"),
+    ]
+    t_mask = t <= min(40.0, float(t[-1])) if len(t) else np.array([], dtype=bool)
+
+    for i, (name, unit, scale, filename) in enumerate(state_specs):
+        style = state_plot_style(name)
+        truth_plot = truth_state5[t_mask, i] * scale
+        sensor_plot = sensor_state5[t_mask, i] * scale
+        ekf_plot = ekf_state5[t_mask, i] * scale
+        err_plot = smooth_series_for_display(
+            state5_delta[t_mask, i] * scale,
+            int(style["error_smoothing_window"]),
+        )
+        sig3_plot = state5_sig3[t_mask, i] * scale
+
+        fig, axs = plt.subplots(1, 2, figsize=(11, 4), sharex=True)
+        if style["model_on_top"]:
+            axs[0].plot(t[t_mask], ekf_plot, color="r", lw=1.0, label="Оценка", zorder=2)
+            axs[0].plot(t[t_mask], truth_plot, color="k", lw=1.1, label="Модель", zorder=3)
+        else:
+            axs[0].plot(t[t_mask], truth_plot, color="k", lw=1.0, label="Модель", zorder=2)
+            axs[0].plot(t[t_mask], ekf_plot, color="r", lw=1.0, label="Оценка", zorder=3)
+        axs[0].set_ylabel(f"{name} ({unit})")
+        axs[0].set_xlabel("Время (с)")
+        axs[0].grid(True, alpha=0.3)
+        axs[0].legend(fontsize=8)
+
+        if style["sigma_on_top"]:
+            axs[1].plot(t[t_mask], err_plot, color="r", lw=1.0, label="Ошибка оценки", zorder=2)
+            axs[1].fill_between(
+                t[t_mask],
+                -sig3_plot,
+                sig3_plot,
+                color="C0",
+                alpha=float(style["sigma_alpha"]),
+                label="±3σ",
+                zorder=3,
+            )
+        else:
+            axs[1].fill_between(
+                t[t_mask],
+                -sig3_plot,
+                sig3_plot,
+                color="C0",
+                alpha=float(style["sigma_alpha"]),
+                label="±3σ",
+                zorder=1,
+            )
+            axs[1].plot(t[t_mask], err_plot, color="r", lw=1.0, label="Ошибка оценки", zorder=2)
+        axs[1].axhline(0.0, color="k", lw=0.4)
+        axs[1].set_ylabel(f"Δ{name} ({unit})")
+        axs[1].set_xlabel("Время (с)")
+        axs[1].grid(True, alpha=0.3)
+        axs[1].legend(fontsize=8)
+
+        fig.suptitle(name)
+        fig.tight_layout()
+        p = out / filename
+        fig.savefig(p, dpi=140)
+        plt.close(fig)
+        saved.append(p)
+
+    fig, ax = plt.subplots(figsize=(10, 4), sharex=True)
+    ax.step(t, np.rad2deg(delta_e_ref), where="post", color="C2", lw=1.0)
+    ax.axhline(0.0, color="k", lw=0.4)
+    ax.set_xlabel("Время (с)")
+    ax.set_ylabel("δe, deg")
+    ax.set_title("Ступенчатая команда руля высоты")
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    p = out / "param_ekf.png"
+    p = out / "elevator_deflection.png"
     fig.savefig(p, dpi=140)
     plt.close(fig)
     saved.append(p)
 
-    param_err = np.asarray(result["param_error"], dtype=float)
-    fig, axs = plt.subplots(5, 1, figsize=(10, 10), sharex=True)
+    p_names = ["C_Lα", "C_Lδe", "C_mα", "C_mq", "C_mδe"]
+    fig, axs = plt.subplots(5, 1, figsize=(10, 11), sharex=True)
     for j in range(5):
-        axs[j].plot(t, param_err[:, j], color="C3", lw=0.8)
-        axs[j].axhline(0.0, color="k", lw=0.4)
-        axs[j].set_ylabel(f"Δ {p_names[j]}")
+        trace = pe[:, 4 + j]
+        axs[j].plot(t, trace, color="r", lw=1.1, label="Оценка", zorder=3)
+        axs[j].axhline(p_true[j], color="k", ls="--", lw=0.9, label="Истина")
+        axs[j].axhline(p_init[j], color="C1", ls=":", lw=0.9, label="Начальное")
+        axs[j].plot(t[0], p_init[j], marker="o", color="C1", ms=4)
+        axs[j].plot(t[-1], p_final[j], marker="o", color="C0", ms=4)
+        axs[j].set_ylabel(p_names[j])
+        y_all = np.array([trace.min(), trace.max(), p_true[j], p_init[j], p_final[j]], dtype=float)
+        y_span = float(max(y_all.max() - y_all.min(), 1e-6))
+        y_pad = 0.12 * y_span
+        axs[j].set_ylim(float(y_all.min() - y_pad), float(y_all.max() + y_pad))
         axs[j].grid(True, alpha=0.3)
-    axs[-1].set_xlabel("t, с")
-    fig.suptitle("Ошибка идентификации параметров")
+        axs[j].text(
+            0.01,
+            0.08,
+            f"нач. ошибка={rel_init[j]:.1f}% | итог={rel_final[j]:.1f}%",
+            transform=axs[j].transAxes,
+            fontsize=8,
+            bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+        )
+    axs[0].legend(fontsize=8)
+    axs[-1].set_xlabel("Время (с)")
+    fig.suptitle("Идентификация аэродинамических параметров: старт ±60% и итог относительно истины")
     fig.tight_layout()
-    p = out / "param_ekf_error.png"
+    p = out / "aero_param_identification.png"
     fig.savefig(p, dpi=140)
     plt.close(fig)
     saved.append(p)
@@ -648,7 +941,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--t-model", type=float, default=120.0, help="Длительность модели, с")
     p.add_argument("--auto-trim-thrust", action="store_true", help="Режим с автотримом тяги")
     p.add_argument("--thrust", type=float, default=None, help="Фиксированная тяга, Н (иначе равновесие)")
-    p.add_argument("--with-nz", action="store_true", help="Включить n_z в измерения parameter EKF")
+    p.add_argument("--without-nz", action="store_true", help="Отключить n_z в измерениях parameter EKF")
     p.add_argument(
         "--out-dir",
         type=str,
@@ -668,7 +961,7 @@ if __name__ == "__main__":
         t_model=args.t_model,
         auto_trim_thrust=bool(args.auto_trim_thrust),
         thrust_newtons=thrust,
-        param_ekf_with_nz=bool(args.with_nz),
+        param_ekf_with_nz=not bool(args.without_nz),
     )
     if not args.no_plots:
         paths = save_simulation_plots(res, args.out_dir)
