@@ -13,7 +13,6 @@ from src.navigation_models.noise import (
     ImuNoise,
     imu_reference_sigmas,
     q_gyro_measurement_sigma,
-    theta_ins_measurement_sigma,
 )
 from src.navigation_models.simulate import (
     IdentificationWindow,
@@ -32,9 +31,11 @@ from src.navigation_models.simulate import (
     save_simulation_plots,
     sigma3_state5_from_nav_covariance,
     smooth_series_for_display,
+    state_error_annotation,
     state_error_series,
     state_plot_style,
     state5_from_nav_solution,
+    state5_from_sensor_measurements,
 )
 from src.navigation_models.zala421_16e5 import initial_attitude_nue, zala421_default_config
 
@@ -87,10 +88,6 @@ def test_altimeter_reference_sigma_is_one_meter():
 
 def test_q_gyro_measurement_sigma_is_large_enough_for_visible_sensor_error():
     assert np.isclose(q_gyro_measurement_sigma(), 0.01)
-
-
-def test_theta_ins_measurement_sigma_matches_visible_theta_error_level():
-    assert np.isclose(theta_ins_measurement_sigma(), np.deg2rad(0.05))
 
 
 def test_nav_ekf_initial_sigmas_match_reference_table():
@@ -164,9 +161,33 @@ def test_run_simulation_returns_altimeter_and_7d_nav_state():
     res = run_simulation(t_model=0.05)
     assert np.asarray(res["truth_nav"]).shape[1] == 8
     assert np.asarray(res["altimeter"]).ndim == 1
-    assert np.asarray(res["theta_ins"]).ndim == 1
     assert np.asarray(res["q_gyro"]).ndim == 1
     assert int(res["ekf"]["nav_state_dim"]) == 8
+
+
+def test_run_simulation_does_not_expose_separate_theta_sensor_channel():
+    res = run_simulation(t_model=0.05)
+    assert "theta_ins" not in res
+    assert int(res["ekf"]["meas_dim"]) == 6
+
+
+def test_state5_from_sensor_measurements_uses_bins_pitch_channel_for_theta():
+    gnss = np.array([[30.0, 40.0, 3.0, 0.1]], dtype=float)
+    bins = np.array([[0.0, 0.2, 0.0, 100.0, 0.0, 0.0]], dtype=float)
+    c_bn = np.zeros((1, 3, 3), dtype=float)
+    theta = 0.12
+    c_bn[0] = np.array(
+        [
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    q_gyro = np.array([0.03], dtype=float)
+    altimeter = np.array([123.0], dtype=float)
+    state5 = state5_from_sensor_measurements(gnss, bins, c_bn, q_gyro, altimeter)
+    assert np.isclose(state5[0, 2], theta)
 
 
 def test_longitudinal_measurement_covariance_is_built_from_nav_covariance():
@@ -216,12 +237,22 @@ def test_state_error_series_returns_ekf_minus_truth():
 def test_state_plot_style_highlights_theta_and_q():
     style_theta = state_plot_style("θ")
     style_q = state_plot_style("q")
+    style_alpha = state_plot_style("α")
     style_v = state_plot_style("V")
     assert style_theta["model_on_top"] is True
     assert style_q["sigma_on_top"] is True
     assert style_theta["sigma_alpha"] > style_v["sigma_alpha"]
     assert style_q["error_smoothing_window"] > style_v["error_smoothing_window"]
     assert style_v["model_on_top"] is False
+    assert style_alpha["show_sigma"] is False
+    assert style_q["show_sigma"] is False
+
+
+def test_state_error_annotation_for_alpha_reports_max_error_degrees():
+    err_deg = np.array([0.1, -0.4, 0.25], dtype=float)
+    text = state_error_annotation("α", err_deg)
+    assert "max |Δα|" in text
+    assert "0.40°" in text
 
 
 def test_smooth_series_for_display_preserves_length_and_softens_spikes():
@@ -349,6 +380,27 @@ def test_alpha_error_is_mostly_inside_three_sigma():
     alpha_err = np.abs(ekf_state5[:, 1] - truth_state5[:, 1])
     inside = alpha_err <= sig3[:, 1]
     assert float(np.mean(inside)) > 0.9
+
+
+def test_initial_speed_error_is_inside_three_sigma():
+    res = run_simulation(t_model=2.0)
+    truth_nav = np.asarray(res["truth_nav"], dtype=float)
+    x_true = np.asarray(res["x_true"], dtype=float)
+    truth_state5 = np.column_stack([x_true[:, 0], x_true[:, 1], x_true[:, 3], x_true[:, 2], truth_nav[:, 5]])
+    ekf_state5 = state5_from_nav_solution(
+        np.asarray(res["ekf"]["x_hat"], dtype=float),
+        np.asarray(res["bins"], dtype=float),
+        np.asarray(res["c_bn"], dtype=float),
+        0.01,
+    )
+    sig3 = sigma3_state5_from_nav_covariance(
+        np.asarray(res["ekf"]["x_hat"], dtype=float),
+        np.asarray(res["bins"], dtype=float),
+        np.asarray(res["ekf"]["p"], dtype=float),
+        0.01,
+    )
+    v_err = np.abs(ekf_state5[:200, 0] - truth_state5[:200, 0])
+    assert np.all(v_err <= sig3[:200, 0])
 
 
 def test_run_simulation_holds_altitude_reasonably():
