@@ -16,11 +16,14 @@ from src.navigation_models.noise import (
     theta_ins_measurement_sigma,
 )
 from src.navigation_models.simulate import (
+    IdentificationWindow,
+    NavigationAccuracyProfile,
     elevator_step_command_deg,
     longitudinal_measurement_covariance_from_nav,
     longitudinal_measurement_from_nav_state,
     navigation_outputs_to_parameter_measurements,
     q_excitation_command_deg,
+    run_navigation_accuracy_sweep,
     run_simulation,
     longitudinal_state_from_fusion,
     nav_ekf_initial_sigmas,
@@ -177,7 +180,6 @@ def test_longitudinal_measurement_covariance_is_built_from_nav_covariance():
 
 
 def test_navigation_outputs_to_parameter_measurements_include_qdot():
-    plant = NonlinearLongitudinalParams.default()
     x_hat_nav = np.array(
         [
             [0.0, 0.0, 30.0, 0.0, 0.5, 300.0, 0.08, 0.00],
@@ -188,18 +190,20 @@ def test_navigation_outputs_to_parameter_measurements_include_qdot():
     )
     p_nav = np.tile(np.diag([1e-8, 1e-8, 0.05, 0.05, 0.05, 1.0, 1e-3, 2e-3]), (3, 1, 1))
     delta_e = np.array([0.0, 0.02, -0.02], dtype=float)
+    nz_hist = np.array([1.0, 1.1, 0.9], dtype=float)
     y_hist, r_hist = navigation_outputs_to_parameter_measurements(
         x_hat_nav,
         p_nav,
         include_nz=True,
         include_qdot=True,
+        nz_hist=nz_hist,
         delta_e_hist=delta_e,
-        plant_params=plant,
         dt=0.01,
     )
     assert y_hist.shape == (3, 6)
     assert r_hist.shape == (3, 6, 6)
     assert abs(float(y_hist[1, -1])) > 0.1
+    assert np.isclose(y_hist[1, 4], 1.1)
 
 
 def test_state_error_series_returns_ekf_minus_truth():
@@ -286,6 +290,45 @@ def test_run_simulation_keeps_cmq_closer_to_truth():
     assert float(rel_final[3]) < 45.0
 
 
+def test_run_simulation_keeps_clde_closer_to_truth():
+    res = run_simulation(t_model=30.0)
+    rel_final = np.asarray(res["param_metrics"]["rel_error_pct_final"], dtype=float)
+    assert float(rel_final[1]) < 20.0
+
+
+def test_run_simulation_uses_measured_nz_not_truth_formula():
+    res = run_simulation(t_model=0.2)
+    nz_hist = np.asarray(res["nz_meas"], dtype=float)
+    y_hist = np.asarray(res["param_ekf"]["y"], dtype=float)
+    assert y_hist.shape[1] == 5
+    assert np.allclose(y_hist[:, 4], nz_hist)
+
+
+def test_identification_window_freezes_parameter_updates_outside_interval():
+    res = run_simulation(t_model=1.0, ident_window=IdentificationWindow(t_start=0.0, t_end=0.2))
+    pe = np.asarray(res["param_ekf"]["x_hat"], dtype=float)
+    mask = np.asarray(res["param_ekf"]["ident_mask"], dtype=bool)
+    last_active = int(np.where(mask)[0][-1])
+    assert np.allclose(pe[last_active], pe[-1])
+
+
+def test_navigation_sweep_writes_separate_results_per_scenario(tmp_path):
+    paths = run_navigation_accuracy_sweep(
+        tmp_path,
+        t_model=0.2,
+        ident_window=IdentificationWindow(t_start=0.0, t_end=0.1),
+        scenarios=[
+            NavigationAccuracyProfile(name="case_a"),
+            NavigationAccuracyProfile(name="case_b", gnss_pos_scale=2.0, q_scale=1.5),
+        ],
+    )
+    assert (tmp_path / "summary.md").exists() or (tmp_path / "SUMMARY.md").exists()
+    assert (tmp_path / "case_a" / "RESULTS.md").exists()
+    assert (tmp_path / "case_a" / "state_q.png").exists()
+    assert (tmp_path / "case_b" / "RESULTS.md").exists()
+    assert len(paths) >= 3
+
+
 def test_alpha_error_is_mostly_inside_three_sigma():
     res = run_simulation(t_model=30.0)
     truth_nav = np.asarray(res["truth_nav"], dtype=float)
@@ -361,3 +404,16 @@ def test_sensor_models_document_exists():
     assert "Что выдает второй EKF" in text
     assert "Как формируются графики" in text
     assert "aero_param_identification.png" in text
+
+
+def test_identification_notes_document_exists():
+    doc = Path("IDENTIFICATION_NOTES.md")
+    assert doc.exists()
+    text = doc.read_text(encoding="utf-8")
+    assert "Почему отклоняются оценки параметров" in text
+    assert "Q первого EKF" in text
+    assert "R первого EKF" in text
+    assert "Q второго EKF" in text
+    assert "R второго EKF" in text
+    assert "CLδe" in text
+    assert "Cmq" in text

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,22 @@ from src.navigation_models.gnss import GnssNoise, gnss_measurement, gnss_referen
 from src.navigation_models.noise import NoiseStreams
 from src.navigation_models.noise import q_gyro_measurement_sigma, theta_ins_measurement_sigma
 from src.navigation_models.zala421_16e5 import Zala421Config, zala421_default_config
+
+
+@dataclass(frozen=True)
+class NavigationAccuracyProfile:
+    name: str = "baseline"
+    gnss_pos_scale: float = 1.0
+    gnss_vel_scale: float = 1.0
+    altimeter_scale: float = 1.0
+    theta_scale: float = 1.0
+    q_scale: float = 1.0
+
+
+@dataclass(frozen=True)
+class IdentificationWindow:
+    t_start: float = 5.0
+    t_end: float = 30.0
 
 
 def pitch_from_c_bn(c_bn: np.ndarray) -> float:
@@ -84,6 +101,42 @@ def nav_ekf_initial_sigmas() -> dict[str, float]:
     }
 
 
+def scaled_gnss_sigmas(profile: NavigationAccuracyProfile) -> dict[str, float]:
+    ref = gnss_reference_sigmas()
+    return {
+        "pseudorange": ref["pseudorange"] * float(profile.gnss_pos_scale),
+        "pseudorange_rate": ref["pseudorange_rate"] * float(profile.gnss_vel_scale),
+        "phi": ref["phi"] * float(profile.gnss_pos_scale),
+        "lambda": ref["lambda"] * float(profile.gnss_pos_scale),
+        "vn": ref["vn"] * float(profile.gnss_vel_scale),
+        "ve": ref["ve"] * float(profile.gnss_vel_scale),
+    }
+
+
+def scaled_altimeter_sigma(profile: NavigationAccuracyProfile) -> float:
+    return float(altimeter_reference_sigma() * float(profile.altimeter_scale))
+
+
+def scaled_theta_ins_sigma(profile: NavigationAccuracyProfile) -> float:
+    return float(theta_ins_measurement_sigma() * float(profile.theta_scale))
+
+
+def scaled_q_gyro_sigma(profile: NavigationAccuracyProfile) -> float:
+    return float(q_gyro_measurement_sigma() * float(profile.q_scale))
+
+
+def nz_from_specific_force_measurement(a_body_hist: np.ndarray, g: float = 9.80665) -> np.ndarray:
+    acc = np.asarray(a_body_hist, dtype=float)
+    if acc.ndim != 2 or acc.shape[1] != 3:
+        raise ValueError("a_body_hist должен иметь размерность [N,3]")
+    return -acc[:, 2] / float(g)
+
+
+def identification_mask(time_hist: np.ndarray, window: IdentificationWindow) -> np.ndarray:
+    t = np.asarray(time_hist, dtype=float)
+    return (t >= float(window.t_start)) & (t <= float(window.t_end))
+
+
 def longitudinal_measurement_from_nav_state(x_nav: np.ndarray) -> np.ndarray:
     vn = float(x_nav[2])
     ve = float(x_nav[3])
@@ -141,6 +194,7 @@ def ekf_fuse_bins_gnss(
     q_gyro_hist: np.ndarray,
     c_bn_hist: np.ndarray,
     dt: float,
+    profile: NavigationAccuracyProfile | None = None,
 ) -> dict[str, np.ndarray]:
     n = bins_hist.shape[0]
     state_dim = 8
@@ -149,13 +203,14 @@ def ekf_fuse_bins_gnss(
     p_hist = np.zeros((n, state_dim, state_dim), dtype=float)
     sig3_hist = np.zeros((n, state_dim), dtype=float)
 
-    gnss_sig = gnss_reference_sigmas()
+    nav_profile = profile or NavigationAccuracyProfile()
+    gnss_sig = scaled_gnss_sigmas(nav_profile)
     gnss_pos_std = gnss_sig["phi"]
     gnss_vel_std = gnss_sig["vn"]
-    alt_std = altimeter_reference_sigma()
+    alt_std = scaled_altimeter_sigma(nav_profile)
     init_sig = nav_ekf_initial_sigmas()
-    theta_std = theta_ins_measurement_sigma()
-    q_std = q_gyro_measurement_sigma()
+    theta_std = scaled_theta_ins_sigma(nav_profile)
+    q_std = scaled_q_gyro_sigma(nav_profile)
 
     bins_nav = np.column_stack(
         [bins_hist[:, 4], bins_hist[:, 5], bins_hist[:, 0], bins_hist[:, 2]]
@@ -343,17 +398,19 @@ def sigma3_state5_from_nav_covariance(
     bins_hist: np.ndarray,
     p_hist: np.ndarray,
     dt: float,
+    profile: NavigationAccuracyProfile | None = None,
 ) -> np.ndarray:
-    init_sig = nav_ekf_initial_sigmas()
-    gnss_sig = gnss_reference_sigmas()
+    nav_profile = profile or NavigationAccuracyProfile()
+    gnss_sig = scaled_gnss_sigmas(nav_profile)
     long_sig3 = sigma3_longitudinal_state(
         x_hat_nav,
         bins_hist,
         p_hist,
         gnss_vel_std=gnss_sig["vn"],
-        sigma_theta_ins=theta_ins_measurement_sigma(),
+        sigma_theta_ins=scaled_theta_ins_sigma(nav_profile),
         dt=dt,
-        sigma_vh=init_sig["vh"],
+        sigma_vh=nav_ekf_initial_sigmas()["vh"],
+        sigma_q_gyro=scaled_q_gyro_sigma(nav_profile),
     )
     h_sig3 = 3.0 * np.sqrt(np.maximum(p_hist[:, 5, 5], 0.0))
     th_sig3 = 3.0 * np.sqrt(np.maximum(p_hist[:, 6, 6], 0.0))
@@ -386,8 +443,8 @@ def navigation_outputs_to_parameter_measurements(
     *,
     include_nz: bool,
     include_qdot: bool,
+    nz_hist: np.ndarray | None,
     delta_e_hist: np.ndarray,
-    plant_params: NonlinearLongitudinalParams,
     dt: float,
     nz_var: float = (5e-3) ** 2,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -405,8 +462,9 @@ def navigation_outputs_to_parameter_measurements(
         y_parts = [y_base]
         r_blocks = [r_base]
         if include_nz:
-            nz_m = load_factor_nz(y_base, float(delta_e_hist[k]), plant_params)
-            y_parts.append(np.array([nz_m], dtype=float))
+            if nz_hist is None:
+                raise ValueError("Для include_nz=True требуется nz_hist")
+            y_parts.append(np.array([float(nz_hist[k])], dtype=float))
             r_blocks.append(np.array([[nz_var]], dtype=float))
         if include_qdot:
             y_parts.append(np.array([q_dot_hist[k]], dtype=float))
@@ -430,12 +488,13 @@ def sigma3_longitudinal_state(
     dt: float,
     *,
     sigma_vh: float | None = None,
+    sigma_q_gyro: float | None = None,
     inflation: float = 1.08,
 ) -> np.ndarray:
     n = x_hat_nav.shape[0]
     sig3 = np.zeros((n, 4), dtype=float)
     sig_vh = float(gnss_vel_std if sigma_vh is None else sigma_vh)
-    sigma_q_gyro = q_gyro_measurement_sigma()
+    sigma_q_val = float(q_gyro_measurement_sigma() if sigma_q_gyro is None else sigma_q_gyro)
     nav7 = x_hat_nav.shape[1] >= 7 and p_hist.shape[1] >= 7
     nav6 = x_hat_nav.shape[1] >= 6 and p_hist.shape[1] >= 6
 
@@ -475,7 +534,7 @@ def sigma3_longitudinal_state(
         sig3[k, 1] = 3.0 * np.sqrt(max(var_alpha, 0.0))
 
         sig3[k, 3] = 3.0 * sig_th_k
-        sig_q_k = np.sqrt((np.sqrt(2.0) * sig_th_k / max(dt, 1e-9)) ** 2 + sigma_q_gyro**2)
+        sig_q_k = np.sqrt((np.sqrt(2.0) * sig_th_k / max(dt, 1e-9)) ** 2 + sigma_q_val**2)
         sig3[k, 2] = 3.0 * sig_q_k
 
     sig3 *= float(inflation)
@@ -488,8 +547,12 @@ def run_simulation(
     auto_trim_thrust: bool = False,
     thrust_newtons: float | None = None,
     param_ekf_with_nz: bool = True,
+    profile: NavigationAccuracyProfile | None = None,
+    ident_window: IdentificationWindow | None = None,
 ) -> dict[str, np.ndarray | dict]:
     cfg = config or zala421_default_config()
+    nav_profile = profile or NavigationAccuracyProfile()
+    ident_cfg = ident_window or IdentificationWindow()
     steps = int(t_model / cfg.dt)
     base_dyn = NonlinearLongitudinalParams.default()
     plant_params = replace(
@@ -524,6 +587,8 @@ def run_simulation(
     altimeter_hist = np.zeros(steps, dtype=float)
     theta_ins_hist = np.zeros(steps, dtype=float)
     q_gyro_hist = np.zeros(steps, dtype=float)
+    accel_meas_hist = np.zeros((steps, 3), dtype=float)
+    nz_meas_hist = np.zeros(steps, dtype=float)
     t_hist = np.arange(steps, dtype=float) * cfg.dt
     x_true_hist = np.zeros((steps, 4), dtype=float)
     delta_e_ref_hist = np.zeros(steps, dtype=float)
@@ -588,7 +653,7 @@ def run_simulation(
         w_true_body = np.array([0.0, q_pitch, 0.0], dtype=float)
         imu_noise = noise_streams.sample_imu(cfg.dt)
         w_gyro = gyro_measurement(w_true=w_true_body, params=cfg.bins_params, noise=imu_noise)
-        q, c_bn, np_state, _ = bins2_step(
+        q, c_bn, np_state, a_dlu = bins2_step(
             a_true=a_true_body,
             w_true=w_true_body,
             np_state=np_state,
@@ -600,8 +665,11 @@ def run_simulation(
         )
         bins_hist[i] = np_state
         c_bn_hist[i] = c_bn
-        theta_ins_hist[i] = pitch_from_c_bn(c_bn)
-        q_gyro_hist[i] = float(w_gyro[1] + noise_streams.sample_q_gyro())
+        theta_noise_gain = max(float(nav_profile.theta_scale) - 1.0, 0.0)
+        theta_ins_hist[i] = float(pitch_from_c_bn(c_bn) + theta_noise_gain * noise_streams.sample_theta_ins())
+        q_gyro_hist[i] = float(w_gyro[1] + nav_profile.q_scale * noise_streams.sample_q_gyro())
+        accel_meas_hist[i] = a_dlu
+        nz_meas_hist[i] = float(nz_from_specific_force_measurement(a_dlu[np.newaxis, :])[0])
 
         wn_fi, wn_lm, wn_vn, wn_ve = noise_streams.sample_gnss()
         z, _ = gnss_measurement(
@@ -609,11 +677,16 @@ def run_simulation(
             lm=lm_true,
             vn=vn_true,
             ve=ve_true,
-            noise=GnssNoise(wn_fi=wn_fi, wn_lm=wn_lm, wn_vn=wn_vn, wn_ve=wn_ve),
+            noise=GnssNoise(
+                wn_fi=wn_fi * nav_profile.gnss_pos_scale,
+                wn_lm=wn_lm * nav_profile.gnss_pos_scale,
+                wn_vn=wn_vn * nav_profile.gnss_vel_scale,
+                wn_ve=wn_ve * nav_profile.gnss_vel_scale,
+            ),
             scheme=cfg.gnss_scheme,
         )
         gnss_hist[i] = z
-        h_meas, _ = altimeter_measurement(h_true, noise_streams.sample_altimeter())
+        h_meas, _ = altimeter_measurement(h_true, nav_profile.altimeter_scale * noise_streams.sample_altimeter())
         altimeter_hist[i] = h_meas
 
     ekf_out = ekf_fuse_bins_gnss(
@@ -624,6 +697,7 @@ def run_simulation(
         q_gyro_hist=q_gyro_hist,
         c_bn_hist=c_bn_hist,
         dt=cfg.dt,
+        profile=nav_profile,
     )
     ekf_out["delta_truth_minus_hat"] = truth_nav_hist - ekf_out["x_hat"]
 
@@ -651,7 +725,7 @@ def run_simulation(
             0.02**2,
             0.02**2,
             0.6**2,
-            0.12**2,
+            0.0025**2,
             0.15**2,
             2.0**2,
             0.15**2,
@@ -672,25 +746,27 @@ def run_simulation(
         np.asarray(ekf_out["p"], dtype=float),
         include_nz=bool(param_ekf_with_nz),
         include_qdot=bool(include_qdot),
+        nz_hist=nz_meas_hist,
         delta_e_hist=delta_e_cmd_hist,
-        plant_params=plant_params,
         dt=cfg.dt,
     )
     x_pe[:4] = y_pe_hist[0, :4].copy()
     x0_pe[:4] = x_pe[:4].copy()
+    ident_mask = identification_mask(t_hist, ident_cfg)
     for k in range(steps):
-        de = float(delta_e_cmd_hist[k])
-        yk = y_pe_hist[k].copy()
-        x_pe, p_pe = parameter_ekf_step(
-            x_pe,
-            p_pe,
-            yk,
-            de,
-            cfg.dt,
-            plant_params,
-            pe_cfg,
-            r_override=r_meas_hist[k],
-        )
+        if ident_mask[k]:
+            de = float(delta_e_cmd_hist[k])
+            yk = y_pe_hist[k].copy()
+            x_pe, p_pe = parameter_ekf_step(
+                x_pe,
+                p_pe,
+                yk,
+                de,
+                cfg.dt,
+                plant_params,
+                pe_cfg,
+                r_override=r_meas_hist[k],
+            )
         pe_hist[k] = x_pe
 
     p_hat_hist = pe_hist[:, 4:9]
@@ -716,10 +792,19 @@ def run_simulation(
         "altimeter": altimeter_hist,
         "theta_ins": theta_ins_hist,
         "q_gyro": q_gyro_hist,
+        "nz_meas": nz_meas_hist,
+        "accel_meas": accel_meas_hist,
         "ekf": ekf_out,
         "plant_params": plant_params,
         "p_true": p_true,
-        "param_ekf": {"x_hat": pe_hist, "y": y_pe_hist, "p_cov": p_pe, "x0": x0_pe, "r_meas": r_meas_hist},
+        "param_ekf": {
+            "x_hat": pe_hist,
+            "y": y_pe_hist,
+            "p_cov": p_pe,
+            "x0": x0_pe,
+            "r_meas": r_meas_hist,
+            "ident_mask": ident_mask,
+        },
         "param_error": param_error,
         "param_metrics": {
             "rmse": param_rmse,
@@ -734,6 +819,8 @@ def run_simulation(
         "thrust_fixed_n": thrust_used,
         "auto_trim_thrust": auto_trim_thrust,
         "param_ekf_with_nz": param_ekf_with_nz,
+        "nav_profile": nav_profile,
+        "ident_window": ident_cfg,
     }
 
 
@@ -812,6 +899,7 @@ def save_simulation_plots(result: dict, out_dir: str | Path) -> list[Path]:
     rel_init = np.asarray(result["param_metrics"]["rel_error_pct_initial"], dtype=float)
     rel_final = np.asarray(result["param_metrics"]["rel_error_pct_final"], dtype=float)
     pe = np.asarray(result["param_ekf"]["x_hat"], dtype=float)
+    nav_profile = result.get("nav_profile", NavigationAccuracyProfile())
 
     cfg_dt = float(t[1] - t[0]) if len(t) > 1 else 0.01
     truth_state5 = np.column_stack([x_true[:, 0], x_true[:, 1], x_true[:, 3], x_true[:, 2], truth_nav[:, 5]])
@@ -820,7 +908,7 @@ def save_simulation_plots(result: dict, out_dir: str | Path) -> list[Path]:
     )
     ekf_state5 = state5_from_nav_solution(x_hat, bins_hist, c_bn_hist, cfg_dt)
     state5_delta = state_error_series(truth_state5, ekf_state5)
-    state5_sig3 = sigma3_state5_from_nav_covariance(x_hat, bins_hist, p_hist, cfg_dt)
+    state5_sig3 = sigma3_state5_from_nav_covariance(x_hat, bins_hist, p_hist, cfg_dt, profile=nav_profile)
     state_specs = [
         ("V", "m/s", 1.0, "state_v.png"),
         ("α", "deg", 180.0 / np.pi, "state_alpha.png"),
@@ -936,12 +1024,105 @@ def save_simulation_plots(result: dict, out_dir: str | Path) -> list[Path]:
     return saved
 
 
+def scenario_slug(name: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip().lower()).strip("_")
+    return slug or "scenario"
+
+
+def write_scenario_results_md(result: dict, out_dir: str | Path) -> Path:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    profile = result.get("nav_profile", NavigationAccuracyProfile())
+    ident_cfg = result.get("ident_window", IdentificationWindow())
+    metrics = result["param_metrics"]
+    p_true = np.asarray(result["p_true"], dtype=float)
+    p_final = np.asarray(metrics["p_hat_final"], dtype=float)
+    rel_final = np.asarray(metrics["rel_error_pct_final"], dtype=float)
+    param_names = ["CLα", "CLδe", "Cmα", "Cmq", "Cmδe"]
+    lines = [
+        f"# Сценарий `{profile.name}`",
+        "",
+        "## Параметры точности навигации",
+        f"- GNSS положение: x{profile.gnss_pos_scale:.2f}",
+        f"- GNSS скорость: x{profile.gnss_vel_scale:.2f}",
+        f"- Высотомер: x{profile.altimeter_scale:.2f}",
+        f"- `θ_ins`: x{profile.theta_scale:.2f}",
+        f"- `q_gyro`: x{profile.q_scale:.2f}",
+        "",
+        "## Окно идентификации",
+        f"- начало: {ident_cfg.t_start:.2f} с",
+        f"- конец: {ident_cfg.t_end:.2f} с",
+        "",
+        "## Итог параметров",
+    ]
+    for name, true_v, est_v, rel_v in zip(param_names, p_true, p_final, rel_final, strict=True):
+        lines.append(f"- `{name}`: истина = {true_v:.6g}, оценка = {est_v:.6g}, ошибка = {rel_v:.3f}%")
+    lines.extend(
+        [
+            "",
+            "## Файлы графиков",
+            "- `state_v.png`",
+            "- `state_alpha.png`",
+            "- `state_theta.png`",
+            "- `state_q.png`",
+            "- `state_h.png`",
+            "- `elevator_deflection.png`",
+            "- `aero_param_identification.png`",
+            "",
+        ]
+    )
+    path = out / "RESULTS.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def run_navigation_accuracy_sweep(
+    out_root: str | Path,
+    *,
+    t_model: float = 30.0,
+    scenarios: list[NavigationAccuracyProfile] | None = None,
+    ident_window: IdentificationWindow | None = None,
+) -> list[Path]:
+    root = Path(out_root)
+    root.mkdir(parents=True, exist_ok=True)
+    scenario_list = scenarios or [
+        NavigationAccuracyProfile(name="good_nav", gnss_pos_scale=0.5, gnss_vel_scale=0.5, altimeter_scale=0.5, theta_scale=0.7, q_scale=0.7),
+        NavigationAccuracyProfile(name="baseline_nav"),
+        NavigationAccuracyProfile(name="poor_nav", gnss_pos_scale=2.0, gnss_vel_scale=2.0, altimeter_scale=2.0, theta_scale=1.5, q_scale=1.5),
+    ]
+    ident_cfg = ident_window or IdentificationWindow()
+    summary_lines = [
+        "# Sweep по точности навигации",
+        "",
+        "| Сценарий | GNSS pos | GNSS vel | Alt | Theta | q | Cmq err % | RESULTS |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    written: list[Path] = []
+    for profile in scenario_list:
+        scenario_dir = root / scenario_slug(profile.name)
+        result = run_simulation(t_model=t_model, profile=profile, ident_window=ident_cfg)
+        save_simulation_plots(result, scenario_dir)
+        md_path = write_scenario_results_md(result, scenario_dir)
+        written.append(md_path)
+        cmq_err = float(np.asarray(result["param_metrics"]["rel_error_pct_final"], dtype=float)[3])
+        summary_lines.append(
+            f"| `{profile.name}` | {profile.gnss_pos_scale:.2f} | {profile.gnss_vel_scale:.2f} | {profile.altimeter_scale:.2f} | {profile.theta_scale:.2f} | {profile.q_scale:.2f} | {cmq_err:.3f} | `{scenario_dir.name}/RESULTS.md` |"
+        )
+    summary_path = root / "SUMMARY.md"
+    summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    written.append(summary_path)
+    return written
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Симуляция БИНС/GNSS + нав. EKF + parameter EKF")
     p.add_argument("--t-model", type=float, default=120.0, help="Длительность модели, с")
     p.add_argument("--auto-trim-thrust", action="store_true", help="Режим с автотримом тяги")
     p.add_argument("--thrust", type=float, default=None, help="Фиксированная тяга, Н (иначе равновесие)")
     p.add_argument("--without-nz", action="store_true", help="Отключить n_z в измерениях parameter EKF")
+    p.add_argument("--run-sweep", action="store_true", help="Запустить sweep по точности навигации")
+    p.add_argument("--ident-start", type=float, default=5.0, help="Начало окна идентификации, с")
+    p.add_argument("--ident-end", type=float, default=30.0, help="Конец окна идентификации, с")
     p.add_argument(
         "--out-dir",
         type=str,
@@ -957,11 +1138,17 @@ if __name__ == "__main__":
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     args = _parse_args()
     thrust = args.thrust
+    ident_cfg = IdentificationWindow(t_start=float(args.ident_start), t_end=float(args.ident_end))
+    if bool(args.run_sweep):
+        written = run_navigation_accuracy_sweep(args.out_dir, t_model=args.t_model, ident_window=ident_cfg)
+        print(f"Сохранено {len(written)} markdown-файлов в {args.out_dir}")
+        raise SystemExit(0)
     res = run_simulation(
         t_model=args.t_model,
         auto_trim_thrust=bool(args.auto_trim_thrust),
         thrust_newtons=thrust,
         param_ekf_with_nz=not bool(args.without_nz),
+        ident_window=ident_cfg,
     )
     if not args.no_plots:
         paths = save_simulation_plots(res, args.out_dir)

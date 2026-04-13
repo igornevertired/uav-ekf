@@ -35,22 +35,25 @@ class NoiseStreams:
     gnss_rng: tuple[np.random.Generator, np.random.Generator, np.random.Generator, np.random.Generator]
     altimeter_rng: np.random.Generator
     q_gyro_rng: np.random.Generator
+    theta_ins_rng: np.random.Generator
 
     @staticmethod
     def from_seed(seed: int = 12345) -> "NoiseStreams":
         root = np.random.default_rng(seed)
-        seeds = root.integers(1, 100_000, size=12)
+        seeds = root.integers(1, 100_000, size=13)
         gyro_rng = tuple(np.random.default_rng(int(s)) for s in seeds[:3])
         accel_rng = tuple(np.random.default_rng(int(s)) for s in seeds[3:6])
         gnss_rng = tuple(np.random.default_rng(int(s)) for s in seeds[6:10])
         altimeter_rng = np.random.default_rng(int(seeds[10]))
         q_gyro_rng = np.random.default_rng(int(seeds[11]))
+        theta_ins_rng = np.random.default_rng(int(seeds[12]))
         return NoiseStreams(
             gyro_rng=gyro_rng,
             accel_rng=accel_rng,
             gnss_rng=gnss_rng,
             altimeter_rng=altimeter_rng,
             q_gyro_rng=q_gyro_rng,
+            theta_ins_rng=theta_ins_rng,
         )
 
     def sample_imu(self, dt: float = 1.0) -> ImuNoise:
@@ -81,6 +84,9 @@ class NoiseStreams:
 
     def sample_q_gyro(self) -> float:
         return float(self.q_gyro_rng.normal(0.0, q_gyro_measurement_sigma()))
+
+    def sample_theta_ins(self) -> float:
+        return float(self.theta_ins_rng.normal(0.0, theta_ins_measurement_sigma()))
 
 
 def q_gyro_measurement_sigma() -> float:
